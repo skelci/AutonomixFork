@@ -100,6 +100,94 @@ void FAutonomixConversationManager::FinalizeStreamingMessage(const FGuid& Messag
 }
 
 // ============================================================================
+// Tool Result Eviction — Token Optimization (Phase 1D)
+// ============================================================================
+
+void FAutonomixConversationManager::EvictOldToolResults(TArray<FAutonomixMessage>& Messages)
+{
+	// Threshold: tool results larger than this (in chars) are eligible for eviction.
+	// ~500 tokens at 4 chars/token = 2000 chars. Only results that have been
+	// "consumed" (followed by an assistant message) are evicted.
+	static constexpr int32 EvictionThresholdChars = 2000;
+
+	// Walk backwards to find the LAST tool_result index that has a subsequent
+	// assistant message. We never evict the most recent tool_result because
+	// the AI hasn't responded to it yet.
+	int32 LastAssistantIdx = -1;
+	for (int32 i = Messages.Num() - 1; i >= 0; --i)
+	{
+		if (Messages[i].Role == EAutonomixMessageRole::Assistant)
+		{
+			LastAssistantIdx = i;
+			break;
+		}
+	}
+
+	if (LastAssistantIdx < 0) return; // No assistant messages — nothing to evict
+
+	int32 EvictedCount = 0;
+	int32 TokensSaved = 0;
+
+	for (int32 i = 0; i < LastAssistantIdx; ++i)
+	{
+		FAutonomixMessage& Msg = Messages[i];
+		if (Msg.Role != EAutonomixMessageRole::ToolResult) continue;
+		if (Msg.Content.Len() <= EvictionThresholdChars) continue;
+
+		// Check there's an assistant message after this tool result
+		// (i.e., the AI has already consumed this result)
+		bool bConsumed = false;
+		for (int32 j = i + 1; j <= LastAssistantIdx; ++j)
+		{
+			if (Messages[j].Role == EAutonomixMessageRole::Assistant)
+			{
+				bConsumed = true;
+				break;
+			}
+		}
+		if (!bConsumed) continue;
+
+		// Build a compact summary from the first ~200 chars
+		int32 OriginalLen = Msg.Content.Len();
+		FString Summary;
+
+		// Try to extract a meaningful first line
+		int32 NewlineIdx = INDEX_NONE;
+		Msg.Content.FindChar(TEXT('\n'), NewlineIdx);
+		if (NewlineIdx != INDEX_NONE && NewlineIdx < 200)
+		{
+			Summary = Msg.Content.Left(NewlineIdx);
+		}
+		else
+		{
+			Summary = Msg.Content.Left(200);
+			if (OriginalLen > 200) Summary += TEXT("...");
+		}
+
+		// Look for success/error indicators
+		bool bHasSuccess = Msg.Content.Contains(TEXT("SUCCESS")) || Msg.Content.Contains(TEXT("success"));
+		bool bHasError = Msg.Content.Contains(TEXT("ERROR")) || Msg.Content.Contains(TEXT("FAILED"));
+		FString StatusHint = bHasError ? TEXT(" [had errors]") : (bHasSuccess ? TEXT(" [succeeded]") : TEXT(""));
+
+		int32 EstTokensSaved = (OriginalLen - Summary.Len()) / ApproxCharsPerToken;
+		TokensSaved += EstTokensSaved;
+
+		Msg.Content = FString::Printf(
+			TEXT("[evicted — %d chars, ~%d tokens saved%s] %s"),
+			OriginalLen, EstTokensSaved, *StatusHint, *Summary);
+
+		EvictedCount++;
+	}
+
+	if (EvictedCount > 0)
+	{
+		UE_LOG(LogAutonomix, Log,
+			TEXT("ConversationManager: Evicted %d old tool result(s), saving ~%d tokens."),
+			EvictedCount, TokensSaved);
+	}
+}
+
+// ============================================================================
 // Context Management: GetEffectiveHistory (v3.0)
 // Ported from Roo Code's getEffectiveApiHistory() in condense/index.ts
 // ============================================================================
@@ -191,6 +279,7 @@ TArray<FAutonomixMessage> FAutonomixConversationManager::GetEffectiveHistory() c
 			Result.Add(Msg);
 		}
 
+		EvictOldToolResults(Result);
 		return Result;
 	}
 
@@ -226,9 +315,9 @@ TArray<FAutonomixMessage> FAutonomixConversationManager::GetEffectiveHistory() c
 		Result.Add(Msg);
 	}
 
-	// CRITICAL: Ensure the effective history never ends with an assistant message that
-	// has unresolved tool_use blocks (ContentBlocksJson with tool_use entries) but no
-	// following tool_result user message.
+	// CRITICAL: Ensure the effective history has no assistant messages with
+	// unresolved tool_use blocks (ContentBlocksJson with tool_use entries) but no
+	// matching tool_result messages.
 	//
 	// This can happen when:
 	//   - The session was interrupted (engine crash, force-close) mid-agentic-loop
@@ -238,91 +327,116 @@ TArray<FAutonomixMessage> FAutonomixConversationManager::GetEffectiveHistory() c
 	// Claude returns HTTP 400: "An assistant message with 'tool_calls' must be followed
 	// by tool messages responding to each 'tool_call_id'".
 	//
-	// Fix: If the last effective message is an assistant with tool_use blocks but no
-	// following tool_result, inject a synthetic user+tool_result message so Claude
+	// Fix: For any assistant message with tool_use blocks where the matching
+	// tool_results are missing, inject synthetic tool_result messages so Claude
 	// can continue the conversation cleanly.
+	//
+	// EXCEPTION: Tool uses in the last assistant message that contains tool_use blocks
+	// are pending execution in the current agentic loop iteration and should not be
+	// treated as orphaned. Only tool_uses from earlier assistant messages that lack
+	// matching tool_results are truly orphaned (e.g., from interrupted sessions).
 	if (Result.Num() > 0)
 	{
-		const FAutonomixMessage& LastMsg = Result.Last();
-		bool bLastIsAssistant = (LastMsg.Role == EAutonomixMessageRole::Assistant);
-		bool bHasToolUse = !LastMsg.ContentBlocksJson.IsEmpty();
-
-		if (bLastIsAssistant && bHasToolUse)
+		// Step 1: Collect all tool_result IDs already present in the effective history
+		TSet<FString> ExistingToolResultIds;
+		for (const FAutonomixMessage& R : Result)
 		{
-			// Extract tool_use IDs from ContentBlocksJson
-			TArray<FString> OrphanedToolUseIds;
+			if (R.Role == EAutonomixMessageRole::ToolResult && !R.ToolUseId.IsEmpty())
 			{
-				TArray<TSharedPtr<FJsonValue>> ContentBlocks;
-				TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(LastMsg.ContentBlocksJson);
-				if (FJsonSerializer::Deserialize(Reader, ContentBlocks))
+				ExistingToolResultIds.Add(R.ToolUseId);
+			}
+		}
+
+		// Step 2: Find the index of the last assistant message that contains tool_use blocks.
+		// Tool uses in this message are pending execution and should NOT be treated as orphaned.
+		int32 LastAssistantWithToolUseIdx = -1;
+		for (int32 i = Result.Num() - 1; i >= 0; --i)
+		{
+			if (Result[i].Role == EAutonomixMessageRole::Assistant && !Result[i].ContentBlocksJson.IsEmpty())
+			{
+				TArray<TSharedPtr<FJsonValue>> CheckBlocks;
+				TSharedRef<TJsonReader<>> CheckReader = TJsonReaderFactory<>::Create(Result[i].ContentBlocksJson);
+				if (FJsonSerializer::Deserialize(CheckReader, CheckBlocks))
 				{
-					for (const TSharedPtr<FJsonValue>& Block : ContentBlocks)
+					bool bHasToolUse = false;
+					for (const TSharedPtr<FJsonValue>& Block : CheckBlocks)
 					{
 						const TSharedPtr<FJsonObject>* BlockObj = nullptr;
-						if (!Block->TryGetObject(BlockObj)) continue;
-						FString BlockType;
-						(*BlockObj)->TryGetStringField(TEXT("type"), BlockType);
-						if (BlockType == TEXT("tool_use"))
+						if (Block->TryGetObject(BlockObj))
 						{
-							FString Id;
-							(*BlockObj)->TryGetStringField(TEXT("id"), Id);
-							if (!Id.IsEmpty())
+							FString BlockType;
+							(*BlockObj)->TryGetStringField(TEXT("type"), BlockType);
+							if (BlockType == TEXT("tool_use"))
 							{
-								OrphanedToolUseIds.Add(Id);
+								bHasToolUse = true;
+								break;
 							}
 						}
 					}
-				}
-			}
-
-			if (OrphanedToolUseIds.Num() > 0)
-			{
-				// Check if there are already tool_results that cover these IDs in history
-				// (shouldn't happen since LastMsg is the last, but be safe)
-				TSet<FString> CoveredIds;
-				for (const FAutonomixMessage& R : Result)
-				{
-					if (R.Role == EAutonomixMessageRole::ToolResult && !R.ToolUseId.IsEmpty())
+					if (bHasToolUse)
 					{
-						CoveredIds.Add(R.ToolUseId);
-					}
-				}
-
-				bool bNeedsSynthetic = false;
-				for (const FString& Id : OrphanedToolUseIds)
-				{
-					if (!CoveredIds.Contains(Id))
-					{
-						bNeedsSynthetic = true;
+						LastAssistantWithToolUseIdx = i;
 						break;
-					}
-				}
-
-				if (bNeedsSynthetic)
-				{
-					UE_LOG(LogAutonomix, Warning,
-						TEXT("ConversationManager::GetEffectiveHistory: Last assistant message has %d orphaned tool_use(s) with no tool_results. "
-						     "Session was likely interrupted. Injecting synthetic tool_results."),
-						OrphanedToolUseIds.Num());
-
-					for (const FString& UseId : OrphanedToolUseIds)
-					{
-						if (!CoveredIds.Contains(UseId))
-						{
-							FAutonomixMessage SyntheticResult;
-							SyntheticResult.MessageId = FGuid::NewGuid();
-							SyntheticResult.Role = EAutonomixMessageRole::ToolResult;
-							SyntheticResult.ToolUseId = UseId;
-							SyntheticResult.Content = TEXT("Session was interrupted before this tool could complete. Please retry the last operation.");
-							SyntheticResult.Timestamp = FDateTime::UtcNow();
-							Result.Add(SyntheticResult);
-						}
 					}
 				}
 			}
 		}
+
+		// Step 3: Scan all assistant messages with tool_use blocks EXCEPT the last one
+		// (which has pending tool executions) and collect orphaned tool_use IDs
+		TArray<FString> OrphanedToolUseIds;
+		for (int32 i = 0; i < Result.Num(); ++i)
+		{
+			// Skip the last assistant message with tool_use — those are pending execution
+			if (i == LastAssistantWithToolUseIdx) continue;
+
+			const FAutonomixMessage& Msg = Result[i];
+			if (Msg.Role != EAutonomixMessageRole::Assistant || Msg.ContentBlocksJson.IsEmpty()) continue;
+
+			TArray<TSharedPtr<FJsonValue>> ContentBlocks;
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Msg.ContentBlocksJson);
+			if (!FJsonSerializer::Deserialize(Reader, ContentBlocks)) continue;
+
+			for (const TSharedPtr<FJsonValue>& Block : ContentBlocks)
+			{
+				const TSharedPtr<FJsonObject>* BlockObj = nullptr;
+				if (!Block->TryGetObject(BlockObj)) continue;
+				FString BlockType;
+				(*BlockObj)->TryGetStringField(TEXT("type"), BlockType);
+				if (BlockType == TEXT("tool_use"))
+				{
+					FString Id;
+					(*BlockObj)->TryGetStringField(TEXT("id"), Id);
+					if (!Id.IsEmpty() && !ExistingToolResultIds.Contains(Id))
+					{
+						OrphanedToolUseIds.Add(Id);
+					}
+				}
+			}
+		}
+
+		// Step 4: Inject synthetic tool_results for truly orphaned tool_uses
+		if (OrphanedToolUseIds.Num() > 0)
+		{
+			UE_LOG(LogAutonomix, Warning,
+				TEXT("ConversationManager::GetEffectiveHistory: Found %d orphaned tool_use(s) from earlier assistant messages with no tool_results. "
+				     "Session was likely interrupted. Injecting synthetic tool_results."),
+				OrphanedToolUseIds.Num());
+
+			for (const FString& UseId : OrphanedToolUseIds)
+			{
+				FAutonomixMessage SyntheticResult;
+				SyntheticResult.MessageId = FGuid::NewGuid();
+				SyntheticResult.Role = EAutonomixMessageRole::ToolResult;
+				SyntheticResult.ToolUseId = UseId;
+				SyntheticResult.Content = TEXT("Session was interrupted before this tool could complete. Please retry the last operation.");
+				SyntheticResult.Timestamp = FDateTime::UtcNow();
+				Result.Add(SyntheticResult);
+			}
+		}
 	}
 
+	EvictOldToolResults(Result);
 	return Result;
 }
 
